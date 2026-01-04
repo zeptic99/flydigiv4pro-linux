@@ -1,5 +1,5 @@
 # Rust
-/target
+/flydigi-xinput/src/target
 **/*.rs.bk
 
 # Build systems
