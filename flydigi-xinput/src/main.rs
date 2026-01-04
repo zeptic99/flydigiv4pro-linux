@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
-use evdev::Device;
+use evdev::{AbsoluteAxisCode, Device, EventType, RelativeAxisCode};
 use std::path::PathBuf;
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn main() -> Result<()> {
     // Find all matching Flydigi/VADER4 devices
@@ -17,92 +19,129 @@ fn main() -> Result<()> {
         println!("  {:?}", path);
     }
 
-    // Open + grab them
-    let mut grabbed = Vec::new();
+    // Open devices once (keep them alive), and classify them
+    let mut controller: Option<Device> = None;
+    let mut mouse: Option<Device> = None;
 
     for path in &matches {
-        let mut dev = Device::open(&path)
-            .with_context(|| format!("Failed to open {:?}", path))?;
-
+        let mut dev = Device::open(path).with_context(|| format!("Failed to open {:?}", path))?;
         let name = dev.name().unwrap_or("<unknown>");
         println!("Opening: {:?}  name={}", path, name);
 
+        let has_brake = has_abs_brake(&dev);
+        let is_mouse = is_mouse_like(&dev);
+
+        // Grab immediately so nothing else can read while we decide
         dev.grab().with_context(|| format!("Failed to grab {:?}", path))?;
         println!("  -> grabbed!");
 
-        // Keep the device alive by storing it; if it gets dropped, grab is released.
-        grabbed.push(dev);
-    }
-
-    println!("\nDetecting which device has ABS_BRAKE (controller):");
-
-    for path in &matches {
-        let dev = Device::open(path)
-            .with_context(|| format!("Failed to open {:?} for inspection", path))?;
-
-        if has_abs_brake(&dev) {
-            println!("-> Controller device: {:?}", path);
+        if has_brake && controller.is_none() {
+            println!("  -> Selected as CONTROLLER (ABS_BRAKE present)");
+            controller = Some(dev);
+        } else if is_mouse && mouse.is_none() {
+            println!("  -> Selected as MOUSE (REL_X/REL_Y present)");
+            mouse = Some(dev);
         } else {
-            println!("-> Not controller:    {:?}", path);
+            println!("  -> Not selected (kept grabbed only while dev lives in this loop)");
+            // IMPORTANT: dev will drop here and ungrab automatically.
+            // If you want to keep *all* devices grabbed, store them in a Vec instead.
         }
     }
 
-    println!("\nAll devices grabbed. Press Enter to release and exit...");
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line).ok();
+    let mut controller =
+        controller.ok_or_else(|| anyhow::anyhow!("No controller device found with ABS_BRAKE"))?;
+    let mut mouse = mouse.ok_or_else(|| anyhow::anyhow!("No mouse-like device found (REL_X/REL_Y)"))?;
+
+    println!("\nReady.");
+    println!("Controller: {}", controller.name().unwrap_or("<unknown>"));
+    println!("Mouse:      {}", mouse.name().unwrap_or("<unknown>"));
+    println!("\nPolling at 1000 Hz. Press Ctrl+C to stop.\n");
+
+    // Start with mouse grabbed (locked)
+    // (it should already be grabbed, but this makes the intent clear)
+    let _ = mouse.grab();
+    let mut mouse_is_released = false;
+
+    let poll_interval = Duration::from_micros(1000);
+    let mut brake_value: i32 = 0;
+
+    loop {
+        let start = Instant::now();
 
 
-    // grabbed devices are dropped here automatically -> grab released
-    Ok(())
-}
-
-fn find_flydigi_devices() -> Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-
-    for entry in std::fs::read_dir("/dev/input").context("read_dir /dev/input")? {
-        let entry = entry?;
-        let path = entry.path();
-
-        // only /dev/input/event*
-        let fname = match path.file_name().and_then(|s| s.to_str()) {
-            Some(s) => s,
-            None => continue,
-        };
-        if !fname.starts_with("event") {
-            continue;
+        for ev in controller.fetch_events()? {
+            if ev.event_type() == EventType::ABSOLUTE {
+                // ev.code() is a number, compare it to ABS_BRAKE's numeric code
+                if ev.code() == AbsoluteAxisCode::ABS_BRAKE.0 {
+                    brake_value = ev.value();
+                }
+            }
         }
 
-        // Try opening; if no permission, skip (we’ll handle perms by running with sudo)
-        let dev = match Device::open(&path) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
+        if brake_value > 0 {
+            // Brake pressed → ungrab mouse
+            if !mouse_is_released {
+                mouse.ungrab()?;
+                mouse_is_released = true;
+                println!("Brake pressed → mouse UNGRABBED");
+            }
+        } else {
+            // Brake released → grab mouse again
+            if mouse_is_released {
+                mouse.grab()?;
+                mouse_is_released = false;
+                println!("Brake released → mouse GRABBED");
+            }
+        }
 
-        let name = dev.name().unwrap_or("").to_lowercase();
-        if name.contains("flydigi") || name.contains("vader4") {
-            out.push(path);
+        let elapsed = start.elapsed();
+        if elapsed < poll_interval {
+            thread::sleep(poll_interval - elapsed);
         }
     }
 
-    out.sort();
-    Ok(out)
-}
+    fn find_flydigi_devices() -> Result<Vec<PathBuf>> {
+        let mut out = Vec::new();
 
-use evdev::AbsoluteAxisCode;
+        for entry in std::fs::read_dir("/dev/input").context("read_dir /dev/input")? {
+            let entry = entry?;
+            let path = entry.path();
 
-fn has_abs_brake(dev: &Device) -> bool {
-    let has_brake = dev
-        .supported_absolute_axes()
-        .map(|axes| axes.contains(AbsoluteAxisCode::ABS_BRAKE))
-        .unwrap_or(false);
+            // only /dev/input/event*
 
-    let name = dev.name().unwrap_or("<unknown>");
+            let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
 
-    if has_brake {
-        println!("ABS_BRAKE found on device: {}", name);
-    } else {
-        println!("No ABS_BRAKE on device: {}", name);
+            if !fname.starts_with("event") {
+                continue;
+            }
+
+            // Try opening; if no permission, skip (run with sudo)
+            let dev = match Device::open(&path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+
+            let name = dev.name().unwrap_or("").to_lowercase();
+            if name.contains("flydigi") || name.contains("vader4") {
+                out.push(path);
+            }
+        }
+
+        out.sort();
+        Ok(out)
     }
 
-    has_brake
+    fn has_abs_brake(dev: &Device) -> bool {
+        dev.supported_absolute_axes()
+            .map(|axes| axes.contains(AbsoluteAxisCode::ABS_BRAKE))
+            .unwrap_or(false)
+    }
+
+    fn is_mouse_like(dev: &Device) -> bool {
+        dev.supported_relative_axes()
+            .map(|axes| axes.contains(RelativeAxisCode::REL_X) && axes.contains(RelativeAxisCode::REL_Y))
+            .unwrap_or(false)
+    }
 }
