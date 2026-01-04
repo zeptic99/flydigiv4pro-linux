@@ -1,17 +1,32 @@
-# Rust
-/flydigi-xinput/src/target
-**/*.rs.bk
 
-# Build systems
-/build
-/out
-*.o
-*.a
-*.so
+# --------------------
+# Rust (any crate, anywhere)
+# --------------------
+**/target/
+**/Cargo.lock
 
-# Editors
+# --------------------
+# Build artifacts (C / Make / misc)
+# --------------------
+**/*.o
+**/*.a
+**/*.so
+**/*.d
+**/*.out
+**/*.tmp
+
+# --------------------
+# Python
+# --------------------
+__pycache__/
+*.pyc
+
+# --------------------
+# Editor / OS junk
+# --------------------
+.DS_Store
+*.swp
+*.swo
 .vscode/
 .idea/
 
-# OS
-.DS_Store
