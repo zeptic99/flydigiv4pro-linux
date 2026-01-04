@@ -1,0 +1,17 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Build systems
+/build
+/out
+*.o
+*.a
+*.so
+
+# Editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
